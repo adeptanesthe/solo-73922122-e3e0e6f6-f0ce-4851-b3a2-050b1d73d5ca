@@ -132,6 +132,66 @@ check("零概率样例显示 -∞", bodyText.includes("-∞") || $("frame-probs"
 // 10. no uncaught UI errors
 check("无未捕获脚本错误", errors.length === 0, errors.join(" | ").slice(0, 200));
 
+// 11. speaker attribution analysis on the dedicated two-speaker sample
+const attrBtn = [...$("sample-buttons").children].find((b) => b.textContent.includes("sample_attribution"));
+check("归属样例按钮存在", !!attrBtn);
+if (attrBtn) {
+  attrBtn.click();
+  await until(() => $("progress-text").textContent.startsWith("0 / 9"), "attribution sample loaded");
+  // advance all frames so the whole window is available
+  $("run-btn").click();
+  await until(() => $("progress-text").textContent.startsWith("9 / 9"), "attr advance", 30000);
+  await until(() => $("stop-btn").hidden, "attr run finished");
+
+  // configure the window and reference
+  $("attr-start").value = "0";
+  $("attr-end").value = "6";
+  $("attr-start").dispatchEvent(new window.Event("input"));
+  $("attr-end").dispatchEvent(new window.Event("input"));
+  $("attr-rebuild").click();
+  await until(() => $("attr-speaker-body").children.length === 7, "speaker table built");
+  check("说话人表格按帧区间生成 7 行", $("attr-speaker-body").children.length === 7);
+  check("样例填表按钮可见", !$("attr-fill-sample").hidden);
+  $("attr-fill-sample").click();
+  await sleep(100);
+  const firstA = $("attr-speaker-body").children[0].querySelectorAll("input")[0].value;
+  check("样例说话人概率已填入", firstA === "0.92", firstA);
+  // rows sum to 1 -> run button enabled
+  check("行和合法时计算按钮可用", !$("attr-run").disabled);
+
+  $("attr-reference").value = "abc";
+  $("attr-reference").dispatchEvent(new window.Event("input"));
+  $("attr-run").click();
+  await until(() => !$("attr-result").hidden && $("attr-result-body").children.length === 3, "attribution result", 20000);
+  check("归属结果逐字显示 3 行", $("attr-result-body").children.length === 3);
+  const speakers = [...$("attr-result-body").children].map((tr) => tr.children[1].textContent.trim());
+  check("首字归甲、含乙归属", speakers[0].includes("甲") && speakers.some((s) => s.includes("乙")), speakers.join(","));
+  check("逐帧证据表已渲染", $("attr-evidence-body").children.length === 7);
+  check("成功后无过期横幅", $("attr-stale").hidden);
+
+  // editing an input marks the previous result stale
+  $("attr-reference").value = "ab";
+  $("attr-reference").dispatchEvent(new window.Event("input"));
+  check("更改输入后标记过期", !$("attr-stale").hidden);
+
+  // invalid row sum keeps the previous result and disables run
+  const inputs = $("attr-speaker-body").children[0].querySelectorAll("input");
+  inputs[0].value = "0.9";
+  inputs[1].value = "0.9";
+  inputs[1].dispatchEvent(new window.Event("input"));
+  check("行和非法时计算按钮禁用", $("attr-run").disabled);
+  check("非法输入保留旧结果", !$("attr-result").hidden && $("attr-result-body").children.length === 3);
+
+  // advancing after a fresh result flags it stale
+  inputs[0].value = "0.92";
+  inputs[1].value = "0.08";
+  inputs[1].dispatchEvent(new window.Event("input"));
+  $("attr-reference").value = "abc";
+  $("attr-reference").dispatchEvent(new window.Event("input"));
+  $("attr-run").click();
+  await until(() => $("attr-stale").hidden, "recompute fresh");
+}
+
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
 process.exit(failed.length ? 1 : 0);

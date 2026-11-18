@@ -55,6 +55,28 @@
     historyEmpty: $("history-empty"),
     busy: $("busy"),
     busyText: $("busy-text"),
+    // Speaker attribution panel.
+    attrPanel: $("attribution-panel"),
+    attrStart: $("attr-start"),
+    attrStartOut: $("attr-start-out"),
+    attrEnd: $("attr-end"),
+    attrEndOut: $("attr-end-out"),
+    attrReference: $("attr-reference"),
+    attrRebuild: $("attr-rebuild"),
+    attrFillSample: $("attr-fill-sample"),
+    attrSpeakerBody: $("attr-speaker-body"),
+    attrTableEmpty: $("attr-table-empty"),
+    attrRun: $("attr-run"),
+    attrRowHint: $("attr-row-hint"),
+    attrError: $("attr-error"),
+    attrResult: $("attr-result"),
+    attrStale: $("attr-stale"),
+    attrStaleInputs: $("attr-stale-inputs"),
+    attrStaleRevision: $("attr-stale-revision"),
+    attrMetaText: $("attr-meta-text"),
+    attrResultBody: $("attr-result-body"),
+    attrEvidenceHead: $("attr-evidence-head"),
+    attrEvidenceBody: $("attr-evidence-body"),
   };
 
   const state = {
@@ -70,6 +92,17 @@
     // Behind the scenes: the last shown state is kept while a request is in
     // flight, so a failed operation leaves the subtitles and progress intact.
     peekLive: false,
+  };
+
+  // Speaker-analysis state, kept separate from the decoding snapshot so that
+  // stale results survive input edits and advances until replaced.
+  const attribution = {
+    rows: [],            // current editable speaker rows: [{a, b, el...}]
+    lastResult: null,    // last successful response payload
+    lastSignature: null, // input signature + revision the result was computed for
+    requestSeq: 0,       // client-side monotonic id; older replies are dropped
+    inFlight: false,
+    sampleSpeakers: null,
   };
 
   // ---------------------------------------------------------------- helpers
@@ -193,6 +226,24 @@
     state.snapshot = null;
     state.loadedSample = sampleName;
     state.peekLive = true;
+
+    // Reset the speaker-analysis panel for the new session.
+    attribution.requestSeq += 1;
+    attribution.inFlight = false;
+    attribution.rows = [];
+    attribution.lastResult = null;
+    attribution.lastSignature = null;
+    attribution.sampleSpeakers = null;
+    els.attrResult.hidden = true;
+    els.attrStale.hidden = true;
+    els.attrSpeakerBody.innerHTML = "";
+    els.attrTableEmpty.hidden = false;
+    els.attrReference.value = "";
+    els.attrStart.value = "0";
+    els.attrEnd.value = "0";
+    els.attrFillSample.hidden = true;
+    showAttrError("");
+
     applyState(payload, { force: true });
     if (state.snapshot) {
       els.peekFrame.value = "0";
@@ -200,6 +251,7 @@
       els.peekFrameOut.textContent = `0 / ${state.snapshot.frame_count}`;
       els.peekNote.textContent = "显示当前帧";
     }
+    syncAttributionBounds();
     updateButtons();
     updateStatusFromSnapshot();
   }
@@ -249,6 +301,10 @@
     renderHistory(snap);
     renderFrameProbs(snap.frame_info);
     els.prefixInput.placeholder = prefix ? `当前前缀：${prefix}` : "例如：啊";
+    syncAttributionBounds();
+    // Any advance / confirm / undo bumps the revision, which invalidates a
+    // previously computed attribution result until it is recomputed.
+    markAttributionStale();
     updateButtons();
     updateStatusFromSnapshot();
   }
@@ -527,6 +583,343 @@
     updateStatusFromSnapshot();
   }
 
+  // -------------------------------------------------------- speaker attribution
+
+  function attrFmt(value, digits = 3) {
+    if (value === null || value === undefined || Number.isNaN(value)) return "—";
+    if (!Number.isFinite(value)) return "-∞";
+    return Number(value).toFixed(digits);
+  }
+
+  function attrCurrentRange() {
+    const start = Number(els.attrStart.value);
+    const end = Number(els.attrEnd.value);
+    return { start, end, count: end - start + 1 };
+  }
+
+  // A signature identifies the exact inputs a result was computed for.  Any
+  // edit changes it and immediately marks the displayed result stale.
+  function attrSignature() {
+    const snap = state.snapshot;
+    const { start, end } = attrCurrentRange();
+    const reference = els.attrReference.value;
+    const rows = attribution.rows.map((r) => `${r.aInput.value}|${r.bInput.value}`).join(";");
+    return JSON.stringify({
+      start,
+      end,
+      reference,
+      rows,
+      revision: snap ? snap.revision : -1,
+    });
+  }
+
+  function showAttrError(message) {
+    if (!message) { els.attrError.hidden = true; els.attrError.textContent = ""; return; }
+    els.attrError.hidden = false;
+    els.attrError.textContent = message;
+  }
+
+  function rebuildSpeakerTable(preferOld = true) {
+    const { start, end, count } = attrCurrentRange();
+    const oldRows = attribution.rows;
+    els.attrSpeakerBody.innerHTML = "";
+    attribution.rows = [];
+
+    const validRange =
+      Number.isInteger(start) && Number.isInteger(end) &&
+      start >= 0 && end >= start && count >= 1 && count <= 64;
+    els.attrTableEmpty.hidden = validRange;
+    if (!validRange) {
+      els.attrTableEmpty.textContent = "帧区间非法：需为 1～64 个连续帧，且不超过已推进帧数。";
+      updateAttrRowHint();
+      return;
+    }
+    els.attrTableEmpty.hidden = true;
+
+    for (let i = 0; i < count; i += 1) {
+      const frame = start + i;
+      const tr = document.createElement("tr");
+      const frameTd = document.createElement("td");
+      frameTd.className = "mono";
+      frameTd.textContent = String(frame);
+
+      const mkCell = (which, old) => {
+        const td = document.createElement("td");
+        td.className = "num";
+        const input = document.createElement("input");
+        input.type = "number";
+        input.min = "0";
+        input.max = "1";
+        input.step = "0.01";
+        const previous = preferOld && oldRows[i] ? oldRows[i][which] : "";
+        input.value = previous;
+        input.dataset.frame = String(frame);
+        input.addEventListener("input", () => {
+          updateAttrRowHint();
+          markAttributionStale();
+        });
+        td.appendChild(input);
+        return { td, input };
+      };
+      const a = mkCell("aInput", true);
+      const b = mkCell("bInput", true);
+
+      const sumTd = document.createElement("td");
+      sumTd.className = "num rowsum mono";
+      tr.append(frameTd, a.td, b.td, sumTd);
+      els.attrSpeakerBody.appendChild(tr);
+      attribution.rows.push({ frame, aInput: a.input, bInput: b.input, sumTd, tr });
+    }
+    updateAttrRowHint();
+  }
+
+  function readRow(row) {
+    const a = Number(row.aInput.value);
+    const b = Number(row.bInput.value);
+    return { a, b };
+  }
+
+  function updateAttrRowHint() {
+    let invalid = 0;
+    for (const row of attribution.rows) {
+      const { a, b } = readRow(row);
+      const aOk = Number.isFinite(a) && a >= 0 && a <= 1;
+      const bOk = Number.isFinite(b) && b >= 0 && b <= 1;
+      const sum = aOk && bOk ? a + b : NaN;
+      const sumOk = Number.isFinite(sum) && Math.abs(sum - 1) <= 1e-6;
+      row.sumTd.dataset.ok = String(sumOk);
+      row.sumTd.textContent = Number.isFinite(sum) ? sum.toFixed(3) : "—";
+      row.tr.classList.toggle("row-invalid", !(aOk && bOk && sumOk));
+      if (!(aOk && bOk && sumOk)) invalid += 1;
+    }
+    const n = attribution.rows.length;
+    els.attrRowHint.textContent = n
+      ? (invalid ? `有 ${invalid} 行概率无效或行和不为 1，已保留上次结果。` : `共 ${n} 行，每行甲+乙=1。`)
+      : "";
+    els.attrRun.disabled = !state.sessionId || n === 0 || invalid > 0;
+    markAttributionStale();
+  }
+
+  // Mark the displayed result stale relative to the current inputs / revision.
+  function markAttributionStale() {
+    if (!attribution.lastResult) return;
+    const current = attrSignature();
+    const stale = current !== attribution.lastSignature;
+    els.attrStale.hidden = !stale;
+    if (stale) {
+      els.attrStaleInputs.textContent = `帧 ${attribution.lastResult.start_frame}–${attribution.lastResult.end_frame}、字幕「${attribution.lastResult.reference}」`;
+      els.attrStaleRevision.textContent = `r${attribution.lastResult.revision}`;
+    }
+  }
+
+  function renderAttributionResult(payload) {
+    attribution.lastResult = payload;
+    attribution.lastSignature = attrSignature();
+    els.attrResult.hidden = false;
+    els.attrStale.hidden = true;
+    showAttrError("");
+
+    const total = payload.log_total === null ? "—" : attrFmt(payload.log_total, 4);
+    const acoustic = payload.log_acoustic_total === null ? "—" : attrFmt(payload.log_acoustic_total, 4);
+    if (!payload.reachable) {
+      els.attrMetaText.textContent =
+        `字幕「${payload.reference}」在所选帧中不可达（路径数 0）。已保留判定所需的输入回显，请修改字幕或帧区间。`;
+    } else {
+      els.attrMetaText.textContent =
+        `字幕「${payload.reference}」· 帧 ${payload.start_frame}–${payload.end_frame} · ` +
+        `折叠路径 ${payload.path_count} 条 · 加权对数概率合计 ${total} · 纯声学对数概率 ${acoustic} · ` +
+        `基于会话版本 r${payload.revision}`;
+    }
+
+    els.attrResultBody.innerHTML = "";
+    for (const ch of payload.characters) {
+      const tr = document.createElement("tr");
+      if (!ch.reachable) tr.className = "unreachable";
+
+      const charTd = document.createElement("td");
+      charTd.className = "mono";
+      charTd.textContent = ch.char;
+
+      const spTd = document.createElement("td");
+      const badge = document.createElement("span");
+      badge.textContent = ch.speaker;
+      badge.className = ch.tied ? "speaker-tied" : (ch.speaker === "甲" ? "speaker-a" : "speaker-b");
+      spTd.appendChild(badge);
+      if (ch.tied && ch.reachable) {
+        const note = document.createElement("span");
+        note.className = "hint";
+        note.textContent = "（同分未定）";
+        spTd.append(document.createTextNode(" "), note);
+      }
+
+      const posterior = (value) => {
+        const td = document.createElement("td");
+        td.className = "num mono";
+        const bar = document.createElement("span");
+        bar.className = "posterior-bar";
+        const fill = document.createElement("i");
+        fill.style.width = `${Math.max(0, Math.min(1, value)) * 100}%`;
+        bar.appendChild(fill);
+        td.append(bar, document.createTextNode((value * 100).toFixed(1) + "%"));
+        return td;
+      };
+      const aTd = posterior(ch.posterior_a);
+      const bTd = posterior(ch.posterior_b);
+
+      const spanTd = document.createElement("td");
+      spanTd.className = "mono hint";
+      spanTd.textContent = ch.reachable ? `${ch.first_frame}–${ch.last_frame}` : "无证据";
+
+      tr.append(charTd, spTd, aTd, bTd, spanTd);
+      els.attrResultBody.appendChild(tr);
+    }
+
+    renderEvidence(payload);
+  }
+
+  function renderEvidence(payload) {
+    const cols = payload.characters.length;
+    const headRow = document.createElement("tr");
+    const head = (text) => {
+      const th = document.createElement("th");
+      th.textContent = text;
+      return th;
+    };
+    headRow.appendChild(head("帧"));
+    headRow.appendChild(head("blank"));
+    for (const ch of payload.characters) {
+      headRow.appendChild(head(`${ch.char}·甲`));
+      headRow.appendChild(head(`${ch.char}·乙`));
+    }
+    els.attrEvidenceHead.innerHTML = "";
+    els.attrEvidenceHead.appendChild(headRow);
+
+    els.attrEvidenceBody.innerHTML = "";
+    payload.frame_evidence.forEach((ev) => {
+      const tr = document.createElement("tr");
+      const frameTd = document.createElement("td");
+      frameTd.className = "mono";
+      frameTd.textContent = String(ev.frame);
+      const blankTd = document.createElement("td");
+      blankTd.className = "num mono";
+      blankTd.textContent = ev.blank_prob.toFixed(3);
+      tr.append(frameTd, blankTd);
+      for (let j = 0; j < cols; j += 1) {
+        const a = ev.label_a[j] || 0;
+        const b = ev.label_b[j] || 0;
+        const aTd = document.createElement("td");
+        aTd.className = "num mono " + (a > 0 ? "cell-a" : "zero");
+        aTd.textContent = a > 0 ? a.toFixed(3) : "·";
+        const bTd = document.createElement("td");
+        bTd.className = "num mono " + (b > 0 ? "cell-b" : "zero");
+        bTd.textContent = b > 0 ? b.toFixed(3) : "·";
+        tr.append(aTd, bTd);
+      }
+      els.attrEvidenceBody.appendChild(tr);
+    });
+  }
+
+  async function runAttribution() {
+    if (!state.sessionId || !state.snapshot) return;
+    const { start, end, count } = attrCurrentRange();
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) {
+      showAttrError("帧区间非法。");
+      return;
+    }
+    if (count < 1 || count > 64) {
+      showAttrError("帧区间必须是连续 1～64 帧。");
+      return;
+    }
+    if (end >= state.snapshot.next_frame) {
+      showAttrError("结束帧超出已推进范围，请先推进到该帧之后再分析。");
+      return;
+    }
+    const reference = els.attrReference.value.trim();
+    if (!reference) {
+      showAttrError("参考字幕不能为空。");
+      return;
+    }
+    if (reference.length > 16) {
+      showAttrError("参考字幕至多 16 个字。");
+      return;
+    }
+    const speakerProbs = [];
+    for (const row of attribution.rows) {
+      const { a, b } = readRow(row);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || a < 0 || a > 1 || b < 0 || b > 1
+          || Math.abs(a + b - 1) > 1e-6) {
+        showAttrError("存在无效的说话人概率或行和不为 1，已保留上次结果。");
+        return;
+      }
+      speakerProbs.push([a, b]);
+    }
+    if (speakerProbs.length !== count) {
+      showAttrError("说话人概率行数与所选帧数不一致，请重建表格。");
+      return;
+    }
+
+    const seq = ++attribution.requestSeq;
+    const analysisId = `attr-${Date.now()}-${seq}`;
+    const signature = attrSignature();
+    attribution.inFlight = true;
+    els.attrRun.disabled = true;
+    showAttrError("");
+    try {
+      const payload = await api("/api/attribution", {
+        method: "POST",
+        body: JSON.stringify({
+          session_id: state.sessionId,
+          start_frame: start,
+          end_frame: end,
+          reference,
+          speaker_probs: speakerProbs,
+          analysis_id: analysisId,
+        }),
+      });
+      // A newer request already superseded this one: never overwrite.
+      if (seq !== attribution.requestSeq) return;
+      renderAttributionResult(payload);
+      // If the session advanced while the request was in flight, the freshly
+      // rendered result is already stale relative to the new revision.
+      if (attrSignature() !== signature || payload.revision !== state.snapshot.revision) {
+        markAttributionStale();
+      }
+    } catch (error) {
+      if (seq !== attribution.requestSeq) return;
+      // Validation / unreachable errors keep the previous result on screen and
+      // only surface a message; they must not overwrite any older conclusion.
+      showAttrError(`归属分析未更新：${error.message}（已保留上次结果）`);
+      markAttributionStale();
+    } finally {
+      attribution.inFlight = false;
+      updateAttrRowHint();
+    }
+  }
+
+  function syncAttributionBounds() {
+    const snap = state.snapshot;
+    const maxFrame = snap ? Math.max(0, snap.next_frame - 1) : 0;
+    els.attrStart.max = String(maxFrame);
+    els.attrEnd.max = String(maxFrame);
+    if (Number(els.attrStart.value) > maxFrame) els.attrStart.value = String(maxFrame);
+    if (Number(els.attrEnd.value) > maxFrame) els.attrEnd.value = String(maxFrame);
+    els.attrStartOut.textContent = els.attrStart.value;
+    els.attrEndOut.textContent = els.attrEnd.value;
+  }
+
+  function fillSampleSpeakers() {
+    const sp = attribution.sampleSpeakers;
+    if (!sp || !sp.length) return;
+    const { start } = attrCurrentRange();
+    for (const row of attribution.rows) {
+      const source = sp[row.frame - start];
+      if (!source) continue;
+      row.aInput.value = String(source[0]);
+      row.bInput.value = String(source[1]);
+    }
+    updateAttrRowHint();
+  }
+
   // ------------------------------------------------------------------- wiring
 
   els.beamWidth.addEventListener("input", () => {
@@ -638,6 +1031,31 @@
     peek(frame);
   });
 
+  // Speaker attribution wiring.
+  els.attrRebuild.addEventListener("click", () => {
+    rebuildSpeakerTable(true);
+    showAttrError("");
+  });
+  els.attrRun.addEventListener("click", runAttribution);
+  els.attrFillSample.addEventListener("click", fillSampleSpeakers);
+  els.attrStart.addEventListener("input", () => {
+    els.attrStartOut.textContent = els.attrStart.value;
+    markAttributionStale();
+  });
+  els.attrEnd.addEventListener("input", () => {
+    els.attrEndOut.textContent = els.attrEnd.value;
+    markAttributionStale();
+  });
+  els.attrReference.addEventListener("input", () => {
+    markAttributionStale();
+  });
+  els.attrReference.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      runAttribution();
+    }
+  });
+
   async function loadSamples() {
     try {
       const payload = await api("/api/samples");
@@ -675,6 +1093,15 @@
         }),
       });
       startSession(payload, name);
+      // Samples may ship a matching per-frame 甲/乙 table for the attribution
+      // panel.  It stays on the client and only fills the editable rows.
+      if (Array.isArray(sample.speakers) && sample.speakers.length === sample.frames.length) {
+        attribution.sampleSpeakers = sample.speakers.map((row) => [Number(row[0]), Number(row[1])]);
+        els.attrFillSample.hidden = false;
+      } else {
+        attribution.sampleSpeakers = null;
+        els.attrFillSample.hidden = true;
+      }
       showError("");
       hideNotice();
       showNotice(`已载入样例「${name}」，共 ${payload.frame_count} 帧。`);

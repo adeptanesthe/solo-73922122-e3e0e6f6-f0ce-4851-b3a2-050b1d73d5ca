@@ -77,6 +77,62 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 操作失败（非法前缀、帧越界、会话过期等）返回 4xx，且**不修改**会话；
   前端保留原字幕与进度，仅显示错误信息。
 
+## 说话人归属分析
+
+把双人录音中已校订的字幕逐字归给说话人。在「5. 说话人归属分析」面板中：
+
+1. 从**已推进**的帧里选一段连续 1～64 帧（起始帧 / 结束帧）；
+2. 填入至多 16 个字的参考字幕（字符须在词表内）；
+3. 为每个所选帧填甲、乙两列说话人概率，每行 `p_甲 + p_乙 = 1`；
+4. 点击「计算归属后验」，后端汇总**所有**能经 CTC 折叠为该字幕的路径
+   （精确前向/后向，不做束剪枝），逐字给出归甲 / 归乙的后验概率，同分时标「未定」。
+
+### 归属规则（与 CTC 对齐）
+
+- 一个字跨多个连续非 blank 帧（CTC 同字重复）时，这些帧的说话人**必须一致**；
+  说话人只在两个不同字之间（经 blank 或直接换字）才允许切换。
+- blank 帧不提供说话人证据，只乘声学 blank 概率，不乘 `p_甲 / p_乙`。
+- 两个相同字之间必须有 blank 才能展开成两个字；blank 边界是一次新的发声，
+  因此相邻两个字（含重复字）可以换人。
+- 每条非 blank 路径的权重 = 声学 CTC 概率 × 该帧所属说话人的逐帧概率；
+  一个字的甲、乙后验在「所有把该字读成甲 / 乙的路径质量」之间归一化，
+  两者相等（相对容差 `1e-9`）时判定为「未定」。
+- 响应同时给出折叠为该字幕的路径条数、加权 / 纯声学对数概率合计，以及逐帧
+  非 blank 占用证据，便于核对每个字实际由哪些帧支撑。
+
+### 失效、保留与过期
+
+- 概率无效（非有限数、越界、行和不为 1、行数与帧数不符）、帧区间非法、
+  字幕越界或含词表外字符、字幕在所选帧中**不可达**时，接口返回 `422`，
+  前端**保留上一次结果**，只显示错误，不用新结论覆盖。
+- 归属分析是只读操作，不改动解码会话、不递增 `revision`；但它仍排在该会话的
+  单线程 executor 上，因此与推进 / 确认 / 撤销严格按提交次序执行。
+- 每个请求带客户端 `analysis_id`，响应回传计算时的会话 `revision`。一旦更改
+  任一输入（帧区间、字幕、任意概率行）或会话继续推进，前端立即把旧结果标记为
+  **过期**（横幅注明旧输入与旧版本号）；迟到的响应因 `analysis_id` / 签名较旧
+  而被丢弃，无法覆盖更新的结论。
+
+### 请求与响应
+
+`POST /api/attribution` 请求体：
+
+```json
+{
+  "session_id": "...",
+  "start_frame": 0,
+  "end_frame": 6,
+  "reference": "abc",
+  "speaker_probs": [[0.92, 0.08], [0.88, 0.12]],
+  "analysis_id": "attr-1"
+}
+```
+
+`speaker_probs` 行数须等于 `end_frame - start_frame + 1`，且每行两列和为 1。
+响应中 `characters[]` 逐字给出 `speaker`（`甲` / `乙` / `未定`）、`tied`、
+`posterior_a` / `posterior_b` 与证据帧区间；`frame_evidence[]` 给出逐帧 blank
+概率与各字在甲、乙上的非 blank 占用。
+
+
 ## API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -90,6 +146,7 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/peek` | `{session_id, frame}` 回放已推进帧的候选 |
 | POST | `/api/confirm` | `{session_id, prefix}` 延长已确认前缀 |
 | POST | `/api/undo` | 撤销最近一次确认 |
+| POST | `/api/attribution` | 说话人归属分析（见下） |
 | GET | `/api/samples`、`/api/samples/{name}` | 内置样例 |
 
 状态中的 `beams[].logp_blank` / `logp_nonblank` 为 `null` 表示 `-∞`（JSON 无 `-Infinity`）。
@@ -99,7 +156,7 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## 测试
 
 ```bash
-python3 -m pytest -q tests            # 单元 + HTTP + 并发排序测试（37 项）
+python3 -m pytest -q tests            # 单元 + HTTP + 归属 + 并发排序测试（66 项）
 python3 scripts/make_samples.py       # 重新生成内置样例
 ```
 
@@ -120,6 +177,7 @@ JSDOM_DIR=/tmp/uitest node tests/ui_smoke.mjs http://127.0.0.1:8000
 | `samples/sample_repeat.json` | 连续同字、blank 分隔后的重复字符 |
 | `samples/sample_blank_heavy.json` | 大量 blank 帧中间夹短音 |
 | `samples/sample_sparse_zero.json` | 含 `0` 概率（`-∞`），界面不出现 NaN |
+| `samples/sample_attribution.json` | 附带逐帧甲/乙说话人概率，用于归属分析 |
 
 ## 已知限制
 

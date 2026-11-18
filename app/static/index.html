@@ -146,6 +146,89 @@
       <ol class="history-list" id="history-list"></ol>
       <p class="empty" id="history-empty">还没有确认过前缀。</p>
     </div>
+
+    <!-- -------------------------------------------------- speaker attribution -->
+    <div class="panel attribution" id="attribution-panel">
+      <div class="panel-head">
+        <h2>5. 说话人归属分析</h2>
+        <span class="hint">从已推进帧中选连续 1～64 帧，汇总所有可折叠为该字幕的 CTC 路径。</span>
+      </div>
+
+      <div class="grid two attr-inputs">
+        <label class="field">
+          <span>起始帧 <strong id="attr-start-out">0</strong>（仅可选择已推进帧）</span>
+          <input type="number" id="attr-start" min="0" max="0" step="1" value="0">
+        </label>
+        <label class="field">
+          <span>结束帧 <strong id="attr-end-out">0</strong></span>
+          <input type="number" id="attr-end" min="0" max="0" step="1" value="0">
+        </label>
+        <label class="field grow">
+          <span>参考字幕 <em>（至多 16 个字，字符须在词表内）</em></span>
+          <input type="text" id="attr-reference" maxlength="16" autocomplete="off"
+                 spellcheck="false" placeholder="例如：啊波">
+        </label>
+        <div class="field">
+          <span>说话人概率表</span>
+          <div class="row attr-table-actions">
+            <button type="button" class="ghost" id="attr-rebuild">按帧区间重建表格</button>
+            <button type="button" class="ghost" id="attr-fill-sample" hidden>填入样例说话人概率</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="attr-table-wrap">
+        <table class="speaker-table">
+          <thead>
+            <tr>
+              <th>帧</th>
+              <th class="num">甲概率</th>
+              <th class="num">乙概率</th>
+              <th class="num">行和</th>
+            </tr>
+          </thead>
+          <tbody id="attr-speaker-body"></tbody>
+        </table>
+        <p class="empty" id="attr-table-empty">请先选择帧区间并重建表格。</p>
+      </div>
+
+      <div class="row wrap">
+        <button class="primary" id="attr-run">计算归属后验</button>
+        <span class="hint" id="attr-row-hint"></span>
+      </div>
+      <p class="error" id="attr-error" hidden></p>
+
+      <div class="attr-result" id="attr-result" hidden>
+        <div class="attr-stale-banner notice" id="attr-stale" hidden>
+          以下结果基于<span id="attr-stale-inputs"></span>，对应会话版本 <span id="attr-stale-revision"></span>；
+          输入已更改或会话已继续推进，结果已过期，等待新计算。
+        </div>
+        <div class="attr-meta">
+          <span class="hint" id="attr-meta-text"></span>
+        </div>
+        <table class="attr-result-table">
+          <thead>
+            <tr>
+              <th>字</th>
+              <th>归属</th>
+              <th class="num">甲后验</th>
+              <th class="num">乙后验</th>
+              <th>证据帧区间</th>
+            </tr>
+          </thead>
+          <tbody id="attr-result-body"></tbody>
+        </table>
+        <div class="attr-evidence-wrap">
+          <div class="frame-strip-head">
+            <span>逐帧证据（非 blank 占用，按说话人分列）</span>
+          </div>
+          <table class="evidence-table">
+            <thead id="attr-evidence-head"></thead>
+            <tbody id="attr-evidence-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   </section>
 </main>
 

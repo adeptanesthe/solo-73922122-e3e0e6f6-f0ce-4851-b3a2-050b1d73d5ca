@@ -26,7 +26,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .decoder import DecodeError
+from .attribution import (
+    MAX_REFERENCE_CHARS,
+    MAX_WINDOW_FRAMES,
+    AttributionError,
+    speaker_attribution,
+    validate_speaker_rows,
+)
+from .decoder import DecodeError, finite_or_none
 from . import state as state_module
 from .state import SessionError, SessionManager
 
@@ -66,6 +73,16 @@ class ConfirmBody(BaseModel):
 
 class UndoBody(BaseModel):
     session_id: str
+
+
+class AttributionBody(BaseModel):
+    session_id: str
+    start_frame: int
+    end_frame: int
+    reference: str
+    # One [p_甲, p_乙] row per selected frame; each row sums to 1.
+    speaker_probs: list[list[float]]
+    analysis_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +281,128 @@ async def confirm_endpoint(body: ConfirmBody) -> dict:
 async def undo_endpoint(body: UndoBody) -> dict:
     session = _session_or_404(body.session_id)
     return await _run_op(session, state_module.undo)
+
+
+# ---------------------------------------------------------------------------
+# Speaker attribution
+#
+# Attribution is a read-only analysis: it never mutates the decoding session,
+# so it does not bump ``revision``.  It still runs on the session's single
+# worker, which gives two guarantees the UI relies on:
+#   * an advance issued while an analysis is running is applied afterwards, so
+#     the response's echoed ``revision`` can never describe a newer state than
+#     the frames the analysis actually used;
+#   * analyses of one session execute in submission order.
+# The UI tags every request with its own ``analysis_id`` and marks a result
+# stale when its inputs or the session revision no longer match, so a late
+# response can never overwrite a newer conclusion.
+
+
+@app.post("/api/attribution")
+async def attribution_endpoint(body: AttributionBody) -> dict:
+    session = _session_or_404(body.session_id)
+
+    def run(sess):
+        with sess.lock:
+            revision = sess.revision
+            consumed = sess.next_frame
+
+        # --- frame window --------------------------------------------------
+        if isinstance(body.start_frame, bool) or isinstance(body.end_frame, bool):
+            raise AttributionError("帧号必须是整数")
+        if not isinstance(body.start_frame, int) or not isinstance(body.end_frame, int):
+            raise AttributionError("帧号必须是整数")
+        if body.start_frame < 0 or body.end_frame < body.start_frame:
+            raise AttributionError("帧区间非法：起始帧不能为负，结束帧不能早于起始帧")
+        window = body.end_frame - body.start_frame + 1
+        if window > MAX_WINDOW_FRAMES:
+            raise AttributionError(f"一次最多选择 {MAX_WINDOW_FRAMES} 帧")
+        if body.end_frame >= consumed:
+            raise SessionError("只能分析已经推进过的帧")
+
+        # --- reference text ------------------------------------------------
+        reference = body.reference
+        if not isinstance(reference, str) or not reference:
+            raise AttributionError("参考字幕不能为空")
+        if len(reference) > MAX_REFERENCE_CHARS:
+            raise AttributionError(f"参考字幕最多 {MAX_REFERENCE_CHARS} 个字")
+        token_index = sess.decoder._token_index
+        unknown = [ch for ch in reference if ch not in token_index]
+        if unknown:
+            raise AttributionError(f"参考字幕包含词表外字符：{''.join(unknown)}")
+        label_ids = [token_index[ch] for ch in reference]
+
+        # --- speaker probabilities ----------------------------------------
+        speaker = validate_speaker_rows(body.speaker_probs, window)
+
+        result = speaker_attribution(
+            sess.frames[body.start_frame : body.end_frame + 1],
+            label_ids,
+            speaker,
+            body.start_frame,
+        )
+        if not result.reachable:
+            # Unreachable text is reported as a 422 so the UI keeps its prior
+            # result instead of overwriting it, exactly like invalid inputs.
+            raise AttributionError(
+                f"参考字幕「{reference}」在所选 {window} 帧中不可达："
+                "没有任何 CTC 路径能折叠为该字幕"
+            )
+        result.reference = reference
+        for char, label_id in zip(result.characters, label_ids):
+            char.char = sess.vocab[label_id]
+        return _attribution_to_dict(result, revision, consumed, body.analysis_id)
+
+    future = manager.submit(session, run)
+    try:
+        return await asyncio.wrap_future(future)
+    except SessionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except AttributionError as exc:
+        # 422: the request was understood but the analysis cannot be produced
+        # (invalid probabilities, unreachable text).  The UI keeps its prior
+        # result and surfaces the message instead of overwriting anything.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _attribution_to_dict(result, revision: int, consumed: int, analysis_id) -> dict:
+    return {
+        "analysis_id": analysis_id,
+        "revision": revision,
+        "consumed_frames": consumed,
+        "reachable": result.reachable,
+        "reference": result.reference,
+        "start_frame": result.start_frame,
+        "end_frame": result.end_frame,
+        "log_total": finite_or_none(result.log_total),
+        "log_acoustic_total": finite_or_none(result.log_acoustic_total),
+        "path_count": result.path_count,
+        "characters": [
+            {
+                "char": ch.char,
+                "label_id": ch.label_id,
+                "speaker": ch.speaker,
+                "tied": ch.tied,
+                "reachable": ch.reachable,
+                "posterior_a": ch.posterior_a,
+                "posterior_b": ch.posterior_b,
+                "logp_a": finite_or_none(ch.logp_a),
+                "logp_b": finite_or_none(ch.logp_b),
+                "first_frame": ch.first_frame,
+                "last_frame": ch.last_frame,
+            }
+            for ch in result.characters
+        ],
+        "frame_evidence": [
+            {
+                "frame": ev.frame,
+                "blank_prob": ev.blank_prob,
+                "label_a": ev.label_a,
+                "label_b": ev.label_b,
+            }
+            for ev in result.frame_evidence
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

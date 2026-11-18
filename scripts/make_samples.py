@@ -119,12 +119,48 @@ def sparse_zero_sample():
     }
 
 
+def attribution_sample():
+    vocab = ["<blank>", "a", "b", "c"]
+    # Two speakers: 甲 dominates the opening "a" region, 乙 the "b"/"c" region.
+    # Blank-heavy frames carry neutral (0.5, 0.5) speaker rows.
+    frames = [
+        [0.08, 0.86, 0.04, 0.02],
+        [0.08, 0.86, 0.04, 0.02],
+        [0.82, 0.08, 0.06, 0.04],
+        [0.10, 0.05, 0.80, 0.05],
+        [0.10, 0.05, 0.80, 0.05],
+        [0.78, 0.08, 0.10, 0.04],
+        [0.12, 0.06, 0.06, 0.76],
+        [0.85, 0.05, 0.05, 0.05],
+        [0.92, 0.03, 0.03, 0.02],
+    ]
+    speakers = [
+        [0.92, 0.08],
+        [0.88, 0.12],
+        [0.50, 0.50],
+        [0.15, 0.85],
+        [0.10, 0.90],
+        [0.50, 0.50],
+        [0.20, 0.80],
+        [0.50, 0.50],
+        [0.50, 0.50],
+    ]
+    return {
+        "name": "双人归属示例",
+        "description": "在 CTC 帧概率之外附带逐帧甲/乙说话人概率（每行和为 1），用于说话人归属分析。",
+        "vocab": vocab,
+        "frames": normalise(frames),
+        "speakers": speakers,
+    }
+
+
 def main() -> None:
     SAMPLES.mkdir(parents=True, exist_ok=True)
     for name, payload in (
         ("sample_repeat.json", repeat_sample()),
         ("sample_blank_heavy.json", blank_heavy_sample()),
         ("sample_sparse_zero.json", sparse_zero_sample()),
+        ("sample_attribution.json", attribution_sample()),
     ):
         path = SAMPLES / name
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
