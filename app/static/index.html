@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>流式 CTC 解码工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>流式 CTC 解码工作台</h1>
+    <p class="sub">上传词表与逐帧概率，分块推进，确认 / 撤销前缀，检查候选与对数概率。</p>
+  </div>
+  <div class="status" id="conn-status" data-state="idle">未加载</div>
+</header>
+
+<main>
+  <!-- ---------------------------------------------------------------- setup -->
+  <section class="panel setup" id="setup-panel">
+    <h2>1. 加载声学帧</h2>
+    <div class="grid two">
+      <label class="field">
+        <span>词表 JSON <em>（blank + 至多 8 个单字）</em></span>
+        <input type="file" id="vocab-file" accept=".json,.txt,application/json">
+        <small>样例：<code>["&lt;blank&gt;","啊","阿","波","播"]</code></small>
+      </label>
+      <label class="field">
+        <span>逐帧概率 JSON <em>（至多 2000 帧，每帧与词表等长，取值 0～1）</em></span>
+        <input type="file" id="frames-file" accept=".json,application/json">
+        <small>样例：<code>{"frames": [[0.6, 0.4, 0.0], ...]}</code></small>
+      </label>
+    </div>
+    <div class="grid three">
+      <label class="field">
+        <span>束宽 <strong id="beam-out">8</strong></span>
+        <input type="range" id="beam-width" min="1" max="16" step="1" value="8">
+      </label>
+      <label class="field">
+        <span>分块大小 <strong id="chunk-out">40</strong> 帧</span>
+        <input type="range" id="chunk-size" min="1" max="200" step="1" value="40">
+      </label>
+      <div class="field actions">
+        <span>内置样例</span>
+        <div class="row" id="sample-buttons"></div>
+      </div>
+    </div>
+    <div class="row">
+      <button class="primary" id="load-btn">上传并创建会话</button>
+      <button class="ghost" id="reset-btn" disabled>清空会话</button>
+      <span class="hint" id="setup-hint">文件不会离开本机；解码在服务端内存中完成。</span>
+    </div>
+    <p class="error" id="setup-error" hidden></p>
+  </section>
+
+  <!-- ------------------------------------------------------------- workspace -->
+  <section class="workspace" id="workspace" hidden>
+    <div class="panel transcript">
+      <div class="panel-head">
+        <h2>2. 字幕与确认</h2>
+        <div class="progress-wrap">
+          <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
+          <span id="progress-text">0 / 0 帧</span>
+        </div>
+      </div>
+
+      <div class="subtitle" id="subtitle">
+        <span class="confirmed" id="confirmed-text"></span><span class="pending" id="pending-text"></span><span class="caret"></span>
+      </div>
+
+      <div class="row wrap">
+        <button class="primary" id="confirm-best">确认当前候选</button>
+        <button class="ghost" id="undo-btn" disabled>撤销上次确认</button>
+        <button class="ghost" id="step-btn">推进分块</button>
+        <button class="ghost" id="run-btn">连续推进</button>
+        <button class="ghost" id="restart-btn">回到起点</button>
+        <button class="ghost danger" id="stop-btn" hidden>停止</button>
+      </div>
+
+      <div class="confirm-editor">
+        <label class="field grow">
+          <span>确认前缀（可在候选基础上编辑）</span>
+          <input type="text" id="prefix-input" autocomplete="off" spellcheck="false" placeholder="例如：啊">
+        </label>
+        <button class="ghost" id="apply-prefix">按输入确认</button>
+      </div>
+
+      <div class="scores" id="prefix-scores">
+        <div class="score-card">
+          <span class="score-label">前缀</span>
+          <span class="score-value mono" id="ps-text">—</span>
+        </div>
+        <div class="score-card">
+          <span class="score-label">末字 blank 路径对数概率</span>
+          <span class="score-value mono" id="ps-blank">—</span>
+        </div>
+        <div class="score-card">
+          <span class="score-label">末字 非 blank 路径对数概率</span>
+          <span class="score-value mono" id="ps-nonblank">—</span>
+        </div>
+        <div class="score-card">
+          <span class="score-label">合计（保留值，未归一化）</span>
+          <span class="score-value mono" id="ps-total">—</span>
+        </div>
+      </div>
+
+      <p class="error" id="op-error" hidden></p>
+      <p class="notice" id="op-notice" hidden></p>
+    </div>
+
+    <div class="panel beams">
+      <div class="panel-head">
+        <h2>3. 候选束</h2>
+        <label class="inline">
+          查看帧
+          <input type="range" id="peek-frame" min="0" max="0" step="1" value="0">
+          <span class="mono" id="peek-frame-out">0</span>
+        </label>
+      </div>
+      <table class="beam-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>候选字幕</th>
+            <th class="num">log P</th>
+            <th class="num">P</th>
+            <th class="num">末字 blank</th>
+            <th class="num">末字非 blank</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="beam-body"></tbody>
+      </table>
+      <p class="empty" id="beam-empty">尚无候选</p>
+      <div class="frame-strip">
+        <div class="frame-strip-head">
+          <span>该帧概率</span>
+          <span class="hint" id="peek-note">显示当前帧</span>
+        </div>
+        <div class="frame-probs" id="frame-probs"></div>
+      </div>
+    </div>
+
+    <div class="panel history">
+      <h2>4. 确认历史</h2>
+      <ol class="history-list" id="history-list"></ol>
+      <p class="empty" id="history-empty">还没有确认过前缀。</p>
+    </div>
+  </section>
+</main>
+
+<div class="busy" id="busy" hidden><div class="spinner"></div><span id="busy-text">计算中…</span></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
